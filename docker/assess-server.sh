@@ -8,6 +8,27 @@ set -euo pipefail
 # separate copy, not a shared script (see build-docs / the split rationale):
 # the VM and container runtimes differ in ways that don't reduce to a flag.
 #
+# Like the VM script, it downloads the WAR and its properties file from GCS,
+# provisions the MySQL DB/user with the credentials found in that properties
+# file, installs the properties for the app to read, and deploys the WAR.
+#
+# Contract (see docker-startup.sh): invoked as `<APP_NAME>.sh APP_NAME APP_ENV`.
+# APP_NAME and APP_ENV arrive as "$1" and "$2".
+#
+# Downloads (from GCS_BASE_URL/APP_ENV/APP_NAME):
+#   ${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/${APP_NAME}.properties  (fixed name)
+#   ${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/<app.war.file>          (versioned)
+#
+# The WAR is VERSIONED (e.g. assess-server-1.0-SNAPSHOT.war). Its exact filename
+# is read from the properties file (key: app.war.file), so releases can bump the
+# WAR name without editing this script. The WAR is always deployed under the
+# stable name ${APP_NAME}.war, so it serves at /${APP_NAME} regardless of version.
+#
+# The properties file is the app's config AND the source of the DB credentials:
+# spring.datasource.username / spring.datasource.password are read out of it to
+# create the MySQL user, and the whole file is installed to /etc/apps for the
+# app to read via -Dconfig.dir (see setenv.sh).
+#
 # Differences from vm/assess-server.sh:
 #   - No `tomcat` service user. In the container image Tomcat runs as the
 #     container's main process (PID 1, as root); there is no separate 'tomcat'
@@ -16,20 +37,24 @@ set -euo pipefail
 #     `set -e`, abort the deploy and kill the container).
 #   - Tomcat is already running (started by tomcat-entrypoint.sh AFTER this script
 #     returns) — so this is a pure deploy step: drop the WAR + write config, then
-#     return. There is no systemd service to coordinate with.
+#     return. There is no systemd service to coordinate with, and no need to wait
+#     for a hot-deploy: Tomcat starts fresh right after and picks up whatever is
+#     in webapps.
 #   - Invoked by docker-startup.sh as `<APP_NAME>.sh APP_NAME APP_ENV`; it returns,
-#     and the entrypoint then execs `catalina.sh run` to serve. So the WAR does
-#     NOT need to hot-deploy into a live Tomcat here — Tomcat starts fresh right
-#     after and picks up whatever is in webapps.
+#     and the entrypoint then execs `catalina.sh run` to serve.
 # -----------------------------------------------------------------------------
 
 # -----------------------------
 # Config
 # -----------------------------
-# APP_NAME / APP_ENV arrive as positional args from docker-startup.sh; fall back to
-# the previous hardcoded default if run standalone.
+# APP_NAME / APP_ENV arrive as positional args from docker-startup.sh; fall back
+# to sane defaults if run standalone.
 APP_NAME="${1:-myapp}"
 APP_ENV="${2:-development}"
+
+# Base GCS location that holds per-environment release artifacts. The WAR and
+# properties file for this deploy live under ${GCS_BASE_URL}/${APP_ENV}/.
+GCS_BASE_URL="gs://deployza-apps"
 
 # Matches the tomcat docker image (build-docker/tomcat-dockerfile):
 #   - Tomcat installed under /opt/tomcat, WARs dropped into its default appBase.
@@ -37,63 +62,134 @@ APP_ENV="${2:-development}"
 TOMCAT_WEBAPPS="/opt/tomcat/webapps"
 CONFIG_DIR="/etc/apps"
 
-# Option A: Google Cloud Storage WAR
-GCS_WAR_URI="gs://my-bucket/releases/myapp.war"
-
-# Option B: Artifact Registry generic repo
-ARTIFACT_WAR_URI=""
-
+# MySQL admin credentials used to provision the app DB/user.
 MYSQL_ROOT_USER="root"
 MYSQL_ROOT_PASSWORD="root_password_here"
 
-APP_DB="myappdb"
-APP_DB_USER="myappuser"
-APP_DB_PASSWORD="change_this_password"
+# The app's own DB name. The user/password are read from the downloaded
+# properties file below.
+APP_DB="${APP_NAME}db"
 
-TMP_WAR="/tmp/${APP_NAME}.war"
+# Both artifacts live in the per-app subfolder ${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/.
+# The properties file has a fixed name (${APP_NAME}.properties); the WAR name is
+# VERSIONED and is read from the properties file (key: app.war.file), so it can
+# change per release without touching this script. The properties URI is derived
+# here; the WAR URI is derived below once the filename is known.
+PROPS_URI="${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/${APP_NAME}.properties"
+
+# The WAR is downloaded to /tmp under its real versioned filename (set once
+# app.war.file is known), so /tmp shows exactly which artifact was deployed.
+# The previous download is cleared first (see below), so only the current
+# deploy's WAR + properties remain.
+TMP_PROPS="/tmp/${APP_NAME}.properties"
 
 # -----------------------------
-# Download WAR
+# Clear the previous download from /tmp
 # -----------------------------
-echo "Downloading WAR for ${APP_NAME} (${APP_ENV})..."
+# Remove this app's prior WAR(s) and properties so /tmp holds only the current
+# deploy. Glob covers any earlier version (${APP_NAME}-*.war), so we don't need
+# to know the old filename. nullglob keeps the rm harmless when nothing matches.
+echo "Clearing previous ${APP_NAME} download from /tmp..."
+shopt -s nullglob
+rm -f /tmp/"${APP_NAME}"-*.war /tmp/"${APP_NAME}".properties
+shopt -u nullglob
 
-if [[ -n "$ARTIFACT_WAR_URI" ]]; then
-  ACCESS_TOKEN="$(gcloud auth print-access-token)"
-  curl -fL \
-    -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-    -o "$TMP_WAR" \
-    "$ARTIFACT_WAR_URI"
-else
-  gsutil cp "$GCS_WAR_URI" "$TMP_WAR"
+# -----------------------------
+# Download properties (drives WAR discovery + DB provisioning)
+# -----------------------------
+echo "Downloading properties for ${APP_NAME} (${APP_ENV})..."
+echo "  props: ${PROPS_URI}"
+
+gsutil cp "$PROPS_URI" "$TMP_PROPS"
+
+read_prop() {
+  # $1 = property key. Prints the trimmed value of the last matching line.
+  local key="$1"
+  sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$TMP_PROPS" \
+    | tail -n1 \
+    | sed 's/[[:space:]]*$//'
+}
+
+# -----------------------------
+# Resolve + download the versioned WAR
+# -----------------------------
+# The uploaded WAR is versioned, e.g. assess-server-1.0-SNAPSHOT.war. Its exact
+# filename lives in the properties file (app.war.file), so the source object is
+#   ${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/${APP_WAR_FILE}
+# but it is deployed under the stable name ${APP_NAME}.war (context path
+# /${APP_NAME}) regardless of version.
+APP_WAR_FILE="$(read_prop 'app.war.file')"
+if [[ -z "$APP_WAR_FILE" ]]; then
+  echo "ERROR: 'app.war.file' not set in ${TMP_PROPS}; cannot resolve WAR filename." >&2
+  exit 1
 fi
 
+# Download to the real versioned filename so /tmp shows exactly what was
+# deployed. Prior downloads for this app were already cleared above.
+TMP_WAR="/tmp/${APP_WAR_FILE}"
+WAR_URI="${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/${APP_WAR_FILE}"
+echo "Downloading WAR ${APP_WAR_FILE}..."
+echo "  WAR: ${WAR_URI}"
+gsutil cp "$WAR_URI" "$TMP_WAR"
+
 # -----------------------------
-# Write application properties BEFORE deploying the WAR
+# Extract DB credentials from the properties file
 # -----------------------------
-# setenv.sh passes -Dconfig.dir=/etc/apps to the JVM; the app reads its config
-# from there, so the properties file must exist before Tomcat starts.
-echo "Writing application properties to ${CONFIG_DIR}/${APP_NAME}.properties..."
+# The downloaded properties file is the source of truth for the DB user/password.
+# Read the spring.datasource.username / .password keys (tolerating surrounding
+# whitespace and an optional space around '='). We do NOT print the password.
+echo "Reading DB credentials from ${TMP_PROPS}..."
+
+APP_DB_USER="$(read_prop 'spring.datasource.username')"
+APP_DB_PASSWORD="$(read_prop 'spring.datasource.password')"
+
+if [[ -z "$APP_DB_USER" || -z "$APP_DB_PASSWORD" ]]; then
+  echo "ERROR: could not read spring.datasource.username/password from ${TMP_PROPS}" >&2
+  exit 1
+fi
+echo "  DB user resolved: ${APP_DB_USER}"
+
+# -----------------------------
+# Create MySQL DB and user
+# -----------------------------
+echo "Creating MySQL database and user..."
+
+mysql -u"${MYSQL_ROOT_USER}" -p"${MYSQL_ROOT_PASSWORD}" <<SQL
+CREATE DATABASE IF NOT EXISTS \`${APP_DB}\`
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+CREATE USER IF NOT EXISTS '${APP_DB_USER}'@'localhost'
+  IDENTIFIED BY '${APP_DB_PASSWORD}';
+
+ALTER USER '${APP_DB_USER}'@'localhost'
+  IDENTIFIED BY '${APP_DB_PASSWORD}';
+
+GRANT ALL PRIVILEGES ON \`${APP_DB}\`.* TO '${APP_DB_USER}'@'localhost';
+
+FLUSH PRIVILEGES;
+SQL
+
+# -----------------------------
+# Install application properties BEFORE deploying the WAR
+# -----------------------------
+# The image exports CONFIG_DIR=/etc/apps and passes -Dconfig.dir=/etc/apps to the
+# JVM (see setenv.sh). The app reads its config from there, so the downloaded
+# properties file must be in place before the WAR starts up.
+echo "Installing application properties to ${CONFIG_DIR}/${APP_NAME}.properties..."
 
 install -d -m 750 "$CONFIG_DIR"
 
 PROPS_FILE="${CONFIG_DIR}/${APP_NAME}.properties"
-umask 077
-cat > "$PROPS_FILE" <<PROPS
-# Generated by docker/assess-server.sh on $(date --iso-8601=seconds)
-spring.datasource.url=jdbc:mysql://localhost:3306/${APP_DB}?useSSL=false&serverTimezone=UTC
-spring.datasource.username=${APP_DB_USER}
-spring.datasource.password=${APP_DB_PASSWORD}
-spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
-PROPS
-umask 022
-chmod 640 "$PROPS_FILE"
+install -m 640 "$TMP_PROPS" "$PROPS_FILE"
 
 # -----------------------------
 # Deploy WAR to Tomcat's appBase
 # -----------------------------
 # Tomcat is not running yet in this container (the entrypoint execs
 # `catalina.sh run` AFTER this script returns), so this is a plain file drop —
-# no hot-deploy race, no service restart. Remove any prior deployment first.
+# no hot-deploy race, no service restart. Remove any prior deployment first so
+# the new one is picked up as a fresh deploy.
 echo "Removing old deployment..."
 rm -rf "${TOMCAT_WEBAPPS:?}/${APP_NAME}"
 rm -f "${TOMCAT_WEBAPPS}/${APP_NAME}.war"
