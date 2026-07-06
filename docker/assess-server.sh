@@ -47,10 +47,15 @@ set -euo pipefail
 # -----------------------------
 # Config
 # -----------------------------
-# APP_NAME / APP_ENV arrive as positional args from docker-startup.sh; fall back
-# to sane defaults if run standalone.
-APP_NAME="${1:-myapp}"
-APP_ENV="${2:-development}"
+# APP_NAME / APP_ENV arrive as positional args from docker-startup.sh. Both are
+# required — refuse to run without them rather than deploying a wrong default.
+if [[ $# -lt 2 || -z "${1:-}" || -z "${2:-}" ]]; then
+  echo "ERROR: APP_NAME and APP_ENV are required." >&2
+  echo "Usage: $0 APP_NAME APP_ENV" >&2
+  exit 1
+fi
+APP_NAME="$1"
+APP_ENV="$2"
 
 # Base GCS location that holds per-environment release artifacts. The WAR and
 # properties file for this deploy live under ${GCS_BASE_URL}/${APP_ENV}/.
@@ -62,13 +67,16 @@ GCS_BASE_URL="gs://deployza-apps"
 TOMCAT_WEBAPPS="/opt/tomcat/webapps"
 CONFIG_DIR="/etc/apps"
 
-# MySQL admin credentials used to provision the app DB/user.
+# MySQL admin credentials used to provision the app DB/user. The baked image
+# installs MySQL with NO root password (see install-mysql.sh), so this is empty
+# by default; an empty password means the -p flag is omitted below.
 MYSQL_ROOT_USER="root"
-MYSQL_ROOT_PASSWORD="root_password_here"
+MYSQL_ROOT_PASSWORD=""
 
-# The app's own DB name. The user/password are read from the downloaded
-# properties file below.
-APP_DB="${APP_NAME}db"
+# The app's own DB name, user, and password are all read from the downloaded
+# properties file below (schema from spring.datasource.url, credentials from
+# spring.datasource.username/.password), so the properties file is the single
+# source of truth and cannot drift from what the app connects to.
 
 # Both artifacts live in the per-app subfolder ${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/.
 # The properties file has a fixed name (${APP_NAME}.properties); the WAR name is
@@ -135,9 +143,10 @@ gsutil cp "$WAR_URI" "$TMP_WAR"
 # -----------------------------
 # Extract DB credentials from the properties file
 # -----------------------------
-# The downloaded properties file is the source of truth for the DB user/password.
-# Read the spring.datasource.username / .password keys (tolerating surrounding
-# whitespace and an optional space around '='). We do NOT print the password.
+# The downloaded properties file is the source of truth for the DB name and
+# user/password. Read the spring.datasource.username / .password keys (tolerating
+# surrounding whitespace and an optional space around '='). We do NOT print the
+# password.
 echo "Reading DB credentials from ${TMP_PROPS}..."
 
 APP_DB_USER="$(read_prop 'spring.datasource.username')"
@@ -149,12 +158,37 @@ if [[ -z "$APP_DB_USER" || -z "$APP_DB_PASSWORD" ]]; then
 fi
 echo "  DB user resolved: ${APP_DB_USER}"
 
+# The schema name is derived from spring.datasource.url so it always matches the
+# schema the app connects to. The URL looks like
+#   jdbc:mysql://host:port/<schema>?param=...
+# Strip everything up to and including the last '/', then drop any '?...' query
+# string. This keeps the script and the app in sync with a single source of truth.
+APP_DB_URL="$(read_prop 'spring.datasource.url')"
+if [[ -z "$APP_DB_URL" ]]; then
+  echo "ERROR: 'spring.datasource.url' not set in ${TMP_PROPS}; cannot resolve DB schema name." >&2
+  exit 1
+fi
+APP_DB="${APP_DB_URL##*/}"   # drop everything up to the last '/'
+APP_DB="${APP_DB%%\?*}"      # drop the '?query=string' if present
+if [[ -z "$APP_DB" ]]; then
+  echo "ERROR: could not parse schema name from spring.datasource.url ('${APP_DB_URL}')." >&2
+  exit 1
+fi
+echo "  DB schema resolved: ${APP_DB}"
+
 # -----------------------------
 # Create MySQL DB and user
 # -----------------------------
 echo "Creating MySQL database and user..."
 
-mysql -u"${MYSQL_ROOT_USER}" -p"${MYSQL_ROOT_PASSWORD}" <<SQL
+# Only pass -p when a root password is actually set; with an empty password we
+# omit the flag entirely so auth goes over the passwordless local socket.
+MYSQL_AUTH_ARGS=(-u"${MYSQL_ROOT_USER}")
+if [[ -n "$MYSQL_ROOT_PASSWORD" ]]; then
+  MYSQL_AUTH_ARGS+=(-p"${MYSQL_ROOT_PASSWORD}")
+fi
+
+mysql "${MYSQL_AUTH_ARGS[@]}" <<SQL
 CREATE DATABASE IF NOT EXISTS \`${APP_DB}\`
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
