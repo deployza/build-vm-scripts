@@ -212,7 +212,14 @@ SQL
 # properties file must be in place before the WAR starts up for the first time.
 echo "Installing application properties to ${CONFIG_DIR}/${APP_NAME}.properties..."
 
-install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 750 "$CONFIG_DIR"
+# NB: `install -d` only applies -o/-g/-m when it CREATES the dir; if /etc/apps
+# already exists (baked image, prior run, another app) it is left as-is. So set
+# ownership + mode explicitly afterwards. Mode 755 (not 750) so any user can
+# TRAVERSE the dir to reach the file — Tomcat needs x on every path component to
+# open the properties file, and 750 with a root-owned /etc/apps locks it out.
+install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 755 "$CONFIG_DIR"
+chown "$TOMCAT_USER":"$TOMCAT_GROUP" "$CONFIG_DIR"
+chmod 755 "$CONFIG_DIR"
 
 PROPS_FILE="${CONFIG_DIR}/${APP_NAME}.properties"
 install -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 640 "$TMP_PROPS" "$PROPS_FILE"
