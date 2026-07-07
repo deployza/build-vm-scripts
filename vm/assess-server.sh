@@ -22,8 +22,8 @@ set -euo pipefail
 #
 # The properties file is the app's config AND the source of the DB credentials:
 # spring.datasource.username / spring.datasource.password are read out of it to
-# create the MySQL user, and the whole file is installed to /etc/apps for the
-# app to read via -Dconfig.dir (see setenv.sh).
+# create the MySQL user, and the whole file is installed to /home/tomcat/apps/conf
+# for the app to read via -Dconfig.dir (see setenv.sh).
 #
 # Logs — this script only echoes to stdout/stderr; it is NOT its own systemd
 # unit. Where its output lands depends on how it is invoked:
@@ -36,7 +36,7 @@ set -euo pipefail
 # This script only DEPLOYS the WAR — the app then runs inside the separate
 # 'tomcat' service, whose logs are elsewhere:
 #   sudo journalctl -u tomcat -f
-#   sudo tail -f /opt/tomcat/logs/catalina.out
+#   sudo tail -f /home/tomcat/instance/logs/catalina.out
 # -----------------------------------------------------------------------------
 
 # -----------------------------
@@ -59,11 +59,13 @@ TOMCAT_SERVICE="tomcat"
 GCS_BASE_URL="gs://deployza-apps"
 
 # These match the tomcat-mysql image (build-vm-images):
-#   - Tomcat installed under /opt/tomcat, WARs dropped into its default appBase.
-#   - Config externalized to /etc/apps and exposed to the app as -Dconfig.dir.
+#   - Tomcat installed under /home/tomcat/instance, WARs dropped into its default
+#     appBase.
+#   - App config externalized to /home/tomcat/apps/conf and exposed to the app as
+#     -Dconfig.dir.
 # See scripts/ubuntu/{install-tomcat.sh,setenv.sh,tomcat.service}.
-TOMCAT_WEBAPPS="/opt/tomcat/webapps"
-CONFIG_DIR="/etc/apps"
+TOMCAT_WEBAPPS="/home/tomcat/instance/webapps"
+CONFIG_DIR="/home/tomcat/apps/conf"
 TOMCAT_USER="tomcat"
 TOMCAT_GROUP="tomcat"
 
@@ -207,51 +209,81 @@ SQL
 # -----------------------------
 # Install application properties BEFORE deploying the WAR
 # -----------------------------
-# The image exports CONFIG_DIR=/etc/apps and passes -Dconfig.dir=/etc/apps to the
-# JVM (see setenv.sh). The app reads its config from there, so the downloaded
-# properties file must be in place before the WAR starts up for the first time.
+# The image exports CONFIG_DIR=/home/tomcat/apps/conf and passes
+# -Dconfig.dir=/home/tomcat/apps/conf to the JVM (see setenv.sh). The app reads
+# its config from there, so the downloaded properties file must be in place
+# before the WAR starts up for the first time.
 echo "Installing application properties to ${CONFIG_DIR}/${APP_NAME}.properties..."
 
-# NB: `install -d` only applies -o/-g/-m when it CREATES the dir; if /etc/apps
-# already exists (baked image, prior run, another app) it is left as-is. So set
-# ownership + mode explicitly afterwards. Mode 755 (not 750) so any user can
-# TRAVERSE the dir to reach the file — Tomcat needs x on every path component to
-# open the properties file, and 750 with a root-owned /etc/apps locks it out.
-install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 755 "$CONFIG_DIR"
+# The baked image already creates ${CONFIG_DIR} owned tomcat:tomcat under the
+# tomcat user's home; `install -d` just makes this idempotent for a fresh dir.
+# Ensure ownership + a mode Tomcat can traverse/read regardless of prior state.
+install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 750 "$CONFIG_DIR"
 chown "$TOMCAT_USER":"$TOMCAT_GROUP" "$CONFIG_DIR"
-chmod 755 "$CONFIG_DIR"
+chmod 750 "$CONFIG_DIR"
 
 PROPS_FILE="${CONFIG_DIR}/${APP_NAME}.properties"
 install -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 640 "$TMP_PROPS" "$PROPS_FILE"
 
 # -----------------------------
-# Deploy WAR to Tomcat (hot deploy, no service restart)
+# Undeploy the previous app cleanly, then deploy the new WAR
 # -----------------------------
-# Tomcat's default host has autoDeploy="true" and unpackWARs="true", so dropping a
-# WAR into the appBase makes Tomcat explode and deploy it live — no restart needed.
-# Remove the previous exploded dir and WAR first so the new one is picked up as a
-# fresh deploy.
-echo "Removing old deployment..."
-rm -rf "${TOMCAT_WEBAPPS:?}/${APP_NAME}"
-rm -f "${TOMCAT_WEBAPPS}/${APP_NAME}.war"
+# Tomcat's default host has autoDeploy="true" and unpackWARs="true", so its
+# HostConfig watcher reacts to changes in the appBase on the live server — no
+# restart needed.
+#
+# UNDEPLOY: rather than rm -rf'ing the exploded dir out from under a running
+# context (which skips the app's shutdown lifecycle and can race Tomcat's own
+# redeploy thread), we delete ONLY ${APP_NAME}.war and let Tomcat undeploy the
+# context itself: it stops the context (running the app's contextDestroyed /
+# @PreDestroy hooks) and then removes the exploded ${APP_NAME}/ directory. The
+# exploded dir disappearing is our signal that the undeploy has completed, so we
+# wait for that before dropping the replacement — otherwise Tomcat could delete
+# the freshly-exploded new app while finishing the old undeploy.
+WAR_PATH="${TOMCAT_WEBAPPS}/${APP_NAME}.war"
+EXPLODED_DIR="${TOMCAT_WEBAPPS:?}/${APP_NAME}"
+
+if [[ -e "$WAR_PATH" || -d "$EXPLODED_DIR" ]]; then
+  echo "Undeploying existing ${APP_NAME} (removing ${APP_NAME}.war, waiting for Tomcat to stop the context)..."
+  rm -f "$WAR_PATH"
+
+  # Wait for Tomcat to finish undeploying: it removes the exploded dir once the
+  # context is stopped. If autoDeploy is somehow off (no watcher), fall back to
+  # removing the exploded dir ourselves after the timeout so the deploy proceeds.
+  undeployed=false
+  for _ in $(seq 1 60); do
+    if [[ ! -d "$EXPLODED_DIR" ]]; then
+      undeployed=true
+      echo "Tomcat undeployed ${APP_NAME}."
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "$undeployed" != true ]]; then
+    echo "WARNING: Tomcat did not undeploy ${APP_NAME} within timeout; removing exploded dir directly." >&2
+    rm -rf "$EXPLODED_DIR"
+  fi
+fi
 
 echo "Deploying new WAR..."
 # Copy to a temp name in the same dir, then rename, so Tomcat's watcher never sees
-# a partially-written WAR.
+# a partially-written WAR. The file is owned tomcat:tomcat before it becomes
+# visible under its final name.
 cp "$TMP_WAR" "${TOMCAT_WEBAPPS}/.${APP_NAME}.war.tmp"
 chown "$TOMCAT_USER":"$TOMCAT_GROUP" "${TOMCAT_WEBAPPS}/.${APP_NAME}.war.tmp"
-mv "${TOMCAT_WEBAPPS}/.${APP_NAME}.war.tmp" "${TOMCAT_WEBAPPS}/${APP_NAME}.war"
+mv "${TOMCAT_WEBAPPS}/.${APP_NAME}.war.tmp" "$WAR_PATH"
 
 echo "Waiting for Tomcat to explode and deploy the WAR..."
 for _ in $(seq 1 60); do
-  if [[ -d "${TOMCAT_WEBAPPS}/${APP_NAME}" ]]; then
-    echo "WAR exploded to ${TOMCAT_WEBAPPS}/${APP_NAME}"
+  if [[ -d "$EXPLODED_DIR" ]]; then
+    echo "WAR exploded to ${EXPLODED_DIR}"
     break
   fi
   sleep 2
 done
 
-if [[ ! -d "${TOMCAT_WEBAPPS}/${APP_NAME}" ]]; then
+if [[ ! -d "$EXPLODED_DIR" ]]; then
   echo "WARNING: WAR not exploded after timeout. Check ${TOMCAT_SERVICE} logs." >&2
 fi
 
