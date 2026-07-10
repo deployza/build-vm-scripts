@@ -21,6 +21,16 @@ set -euo pipefail
 #     <install.app.logback.file>     external logback config
 #   <install.war>                  the versioned WAR
 #
+# Install targets (two DIFFERENT directories under $CATALINA_HOME/conf):
+#   <ctx>.xml                 -> conf/Catalina/localhost/<ctx>.xml
+#                                (Tomcat scans this dir for context descriptors)
+#   app.properties, logback   -> conf/<ctx>/
+#                                (a NON-scanned dir; <ctx>.xml points its
+#                                <Parameter> values here via
+#                                file:${catalina.base}/conf/<ctx>/...)
+# app.properties and logback must NOT go in conf/Catalina/localhost/ — Tomcat
+# would try to deploy the stray logback .xml there as a webapp.
+#
 # install.properties is the single source of truth for the deploy; NOTHING is
 # derived by this script. Keys used:
 #   install.war                  WAR filename to download and deploy
@@ -38,9 +48,10 @@ set -euo pipefail
 # dropped from setenv.sh). Instead <ctx>.xml is installed as
 #   $CATALINA_HOME/conf/Catalina/localhost/<ctx>.xml
 # and its <Parameter> entries are read by the app's ServletContextListener at
-# startup. Tomcat names the context by the file's basename, so <ctx>.xml ->
-# context path /<ctx>. The conf files are installed VERBATIM: the absolute paths
-# inside <ctx>.xml must already match install.catalina.home.
+# startup. Those entries point at app.properties + logback under conf/<ctx>/ (see
+# "Install targets" above). Tomcat names the context by the file's basename, so
+# <ctx>.xml -> context path /<ctx>. The conf files are installed VERBATIM: the
+# absolute paths inside <ctx>.xml must already match install.catalina.home.
 #
 # The WAR is deployed under the stable name <ctx>.war, so it serves at /<ctx>
 # regardless of the versioned filename in install.war.
@@ -104,7 +115,8 @@ MYSQL_ROOT_PASSWORD=""  # install.mysql.root.password  ("" => passwordless socke
 
 # --- Derived in main() from CATALINA_HOME / the conf keys ---------------------
 TOMCAT_WEBAPPS=""       # ${CATALINA_HOME}/webapps
-CATALINA_LOCALHOST=""   # ${CATALINA_HOME}/conf/Catalina/localhost
+CATALINA_LOCALHOST=""   # ${CATALINA_HOME}/conf/Catalina/localhost  (<ctx>.xml)
+CONF_APP_DIR=""         # ${CATALINA_HOME}/conf/${CONTEXT_PATH}  (props + logback)
 STAGED_APP_PROPS=""     # ${STAGE_DIR}/${APP_PROPS_FILE}
 STAGED_CONTEXT_XML=""   # ${STAGE_DIR}/${CONTEXT_PATH}.xml
 STAGED_LOGBACK=""       # ${STAGE_DIR}/${LOGBACK_FILE}
@@ -199,6 +211,9 @@ load_props() {
   # Tomcat locations derived from CATALINA_HOME.
   TOMCAT_WEBAPPS="${CATALINA_HOME}/webapps"
   CATALINA_LOCALHOST="${CATALINA_HOME}/conf/Catalina/localhost"
+  # Non-scanned dir the <ctx>.xml <Parameter> values point at for the app's
+  # properties + logback (file:${catalina.base}/conf/<ctx>/...).
+  CONF_APP_DIR="${CATALINA_HOME}/conf/${CONTEXT_PATH}"
 
   # Staged conf files, by the names install.properties declared.
   STAGED_APP_PROPS="${STAGE_DIR}/${APP_PROPS_FILE}"
@@ -261,27 +276,32 @@ FLUSH PRIVILEGES;
 SQL
 }
 
-# install_context: install the per-webapp context (context.xml + properties +
-# logback) BEFORE the WAR. The app resolves its config/log locations from
-# <CONTEXT_PATH>.xml's <Parameter> entries (read by its ServletContextListener),
-# so these files must be in place under $CATALINA_HOME/conf/Catalina/localhost
-# before the WAR starts up for the first time. Files are installed VERBATIM —
-# the absolute paths inside <CONTEXT_PATH>.xml must already match
+# install_context: install the per-webapp context BEFORE the WAR. The app
+# resolves its config/log locations from <CONTEXT_PATH>.xml's <Parameter> entries
+# (read by its ServletContextListener), so these files must be in place before
+# the WAR starts up for the first time. Files are installed VERBATIM — the
+# absolute paths inside <CONTEXT_PATH>.xml must already match
 # install.catalina.home.
+#
+# TWO destinations:
+#   * <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename sets the
+#     context path) -> conf/Catalina/localhost/, the dir Tomcat scans.
+#   * app.properties + logback are what <CONTEXT_PATH>.xml points its <Parameter>
+#     values at (file:${catalina.base}/conf/<ctx>/...) -> conf/<ctx>/, a dir
+#     Tomcat does NOT scan. They must NOT go in conf/Catalina/localhost/, or
+#     Tomcat would try to deploy the stray logback .xml there as a webapp.
 install_context() {
-  echo "Installing per-webapp context to ${CATALINA_LOCALHOST}/..."
-
+  echo "Installing context descriptor to ${CATALINA_LOCALHOST}/..."
   install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 750 "$CATALINA_LOCALHOST"
-
-  # <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename sets the
-  # context path). The properties + logback it points at are installed alongside
-  # it under the names install.properties declared.
   install -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 640 \
     "$STAGED_CONTEXT_XML" "${CATALINA_LOCALHOST}/${CONTEXT_PATH}.xml"
+
+  echo "Installing app properties + logback to ${CONF_APP_DIR}/..."
+  install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 750 "$CONF_APP_DIR"
   install -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 640 \
-    "$STAGED_APP_PROPS" "${CATALINA_LOCALHOST}/${APP_PROPS_FILE}"
+    "$STAGED_APP_PROPS" "${CONF_APP_DIR}/${APP_PROPS_FILE}"
   install -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 640 \
-    "$STAGED_LOGBACK" "${CATALINA_LOCALHOST}/${LOGBACK_FILE}"
+    "$STAGED_LOGBACK" "${CONF_APP_DIR}/${LOGBACK_FILE}"
 }
 
 # undeploy_previous: undeploy the previous app cleanly if present.

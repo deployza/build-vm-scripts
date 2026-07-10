@@ -9,9 +9,9 @@ set -euo pipefail
 # the VM and container runtimes differ in ways that don't reduce to a flag.
 #
 # Like the VM script, it downloads the app's config FOLDER and the WAR from GCS,
-# provisions the MySQL DB/user, installs the per-webapp Tomcat context
-# (context.xml + properties + logback) into $CATALINA_HOME/conf/Catalina/localhost,
-# and deploys the WAR.
+# provisions the MySQL DB/user, installs the per-webapp Tomcat context (the
+# <ctx>.xml descriptor into conf/Catalina/localhost, and the app.properties +
+# logback it points at into the non-scanned conf/<ctx>/), and deploys the WAR.
 #
 # Contract (see docker-startup.sh): invoked as `<APP_NAME>.sh APP_ENV`.
 # APP_NAME is fixed to "assess-server" here (this IS that script); the single
@@ -42,7 +42,8 @@ set -euo pipefail
 # Instead <ctx>.xml is installed as
 #   $CATALINA_HOME/conf/Catalina/localhost/<ctx>.xml
 # and its <Parameter> entries are read by the app's ServletContextListener at
-# startup. Tomcat names the context by the file's basename, so <ctx>.xml ->
+# startup. Those entries point at app.properties + logback under conf/<ctx>/.
+# Tomcat names the context by the file's basename, so <ctx>.xml ->
 # context path /<ctx>. The conf files are installed VERBATIM: the absolute paths
 # inside <ctx>.xml must already match install.catalina.home (/opt/tomcat for the
 # container image), and the container <ctx>.xml must not point logback at a file
@@ -164,6 +165,9 @@ MYSQL_ROOT_PASSWORD="$(read_prop 'install.mysql.root.password')"
 
 TOMCAT_WEBAPPS="${CATALINA_HOME}/webapps"
 CATALINA_LOCALHOST="${CATALINA_HOME}/conf/Catalina/localhost"
+# Non-scanned dir the <ctx>.xml <Parameter> values point at for the app's
+# properties + logback (file:${catalina.base}/conf/<ctx>/...).
+CONF_APP_DIR="${CATALINA_HOME}/conf/${CONTEXT_PATH}"
 
 # Staged conf files, by the names install.properties declared.
 STAGED_APP_PROPS="${STAGE_DIR}/${APP_PROPS_FILE}"
@@ -219,23 +223,28 @@ FLUSH PRIVILEGES;
 SQL
 
 # -----------------------------
-# Install the per-webapp context (context.xml + properties + logback) BEFORE the WAR
+# Install the per-webapp context BEFORE the WAR
 # -----------------------------
 # The app resolves its config location from <CONTEXT_PATH>.xml's <Parameter>
 # entries (read by its ServletContextListener), so these files must be in place
-# under $CATALINA_HOME/conf/Catalina/localhost before Tomcat starts. Files are
-# installed VERBATIM — the absolute paths inside <CONTEXT_PATH>.xml must already
-# match install.catalina.home.
-echo "Installing per-webapp context to ${CATALINA_LOCALHOST}/..."
-
+# before Tomcat starts. Files are installed VERBATIM — the absolute paths inside
+# <CONTEXT_PATH>.xml must already match install.catalina.home.
+#
+# TWO destinations:
+#   * <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename sets the
+#     context path) -> conf/Catalina/localhost/, the dir Tomcat scans.
+#   * app.properties + logback are what <CONTEXT_PATH>.xml points its <Parameter>
+#     values at (file:${catalina.base}/conf/<ctx>/...) -> conf/<ctx>/, a dir
+#     Tomcat does NOT scan. They must NOT go in conf/Catalina/localhost/, or
+#     Tomcat would try to deploy the stray logback .xml there as a webapp.
+echo "Installing context descriptor to ${CATALINA_LOCALHOST}/..."
 install -d -m 750 "$CATALINA_LOCALHOST"
-
-# <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename sets the
-# context path). The properties + logback it points at are installed alongside it
-# under the names install.properties declared.
 install -m 640 "$STAGED_CONTEXT_XML" "${CATALINA_LOCALHOST}/${CONTEXT_PATH}.xml"
-install -m 640 "$STAGED_APP_PROPS" "${CATALINA_LOCALHOST}/${APP_PROPS_FILE}"
-install -m 640 "$STAGED_LOGBACK" "${CATALINA_LOCALHOST}/${LOGBACK_FILE}"
+
+echo "Installing app properties + logback to ${CONF_APP_DIR}/..."
+install -d -m 750 "$CONF_APP_DIR"
+install -m 640 "$STAGED_APP_PROPS" "${CONF_APP_DIR}/${APP_PROPS_FILE}"
+install -m 640 "$STAGED_LOGBACK" "${CONF_APP_DIR}/${LOGBACK_FILE}"
 
 # -----------------------------
 # Deploy WAR to Tomcat's appBase
