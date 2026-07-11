@@ -278,12 +278,16 @@ FLUSH PRIVILEGES;
 SQL
 }
 
-# install_context: install the per-webapp context BEFORE the WAR. The app
-# resolves its config/log locations from <CONTEXT_PATH>.xml's <Parameter> entries
-# (read by its ServletContextListener), so these files must be in place before
-# the WAR starts up for the first time. Files are installed VERBATIM — the
-# absolute paths inside <CONTEXT_PATH>.xml must already match
-# install.catalina.home.
+# install_context: install the per-webapp context AFTER undeploy_previous but
+# BEFORE deploy_war. The app resolves its config/log locations from
+# <CONTEXT_PATH>.xml's <Parameter> entries (read by its ServletContextListener),
+# so the descriptor must be in place before the new WAR starts up — but NOT
+# before the old context is undeployed: Tomcat's HostConfig treats <ctx>.xml as
+# belonging to the deployed WAR, so undeploying the old WAR deletes
+# conf/Catalina/localhost/<ctx>.xml. If we wrote the descriptor first,
+# undeploy_previous would remove it out from under us and the new WAR would come
+# up with no external config. Files are installed VERBATIM — the absolute paths
+# inside <CONTEXT_PATH>.xml must already match install.catalina.home.
 #
 # TWO destinations:
 #   * <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename sets the
@@ -392,8 +396,10 @@ main() {
   verify_install_files
   download_war
   provision_mysql
-  install_context       # context files must land BEFORE the WAR is deployed
-  undeploy_previous
+  undeploy_previous     # tear down old context FIRST (Tomcat's undeploy of the
+                        # old WAR can delete conf/Catalina/localhost/<ctx>.xml)
+  install_context       # then write the descriptor, so nothing deletes it before
+                        # the new WAR picks it up
   deploy_war
 
   echo "Deployment complete."
