@@ -10,9 +10,9 @@ set -euo pipefail
 # $CATALINA_HOME/conf/Catalina/localhost, and hot-deploys the WAR into the
 # already-running Tomcat.
 #
-# Contract: invoked as `assess-backend.sh APP_ENV` (by assess-server.sh).
-# APP_NAME is fixed to "assess-server" here (the backend's GCS artifacts still
-# live under gs://deployza-apps/<env>/assess-server/); the single argument is
+# Contract: invoked as `assess-server.sh APP_ENV` (by assess-install.sh).
+# APP_NAME is fixed to "assess-server" here (the backend's GCS artifacts live
+# under gs://deployza-apps/<env>/assess-server/); the single argument is
 # APP_ENV ("$1").
 #
 # GCS layout (${GCS_BASE_URL}/${APP_ENV}/${APP_NAME}/):
@@ -64,7 +64,7 @@ set -euo pipefail
 #     vm-startup.service unit, so it lands in that journal:
 #       sudo journalctl -u vm-startup.service -b -f
 #   * Run manually over SSH: output goes to your terminal; capture with
-#       sudo bash assess-backend.sh <APP_ENV> 2>&1 | tee /tmp/assess-backend.log
+#       sudo bash assess-server.sh <APP_ENV> 2>&1 | tee /tmp/assess-server.log
 #
 # This script only DEPLOYS the WAR — the app then runs inside the separate
 # 'tomcat' service, whose logs are elsewhere:
