@@ -42,6 +42,49 @@ readonly CHILD_SCRIPTS=(
   "assess-exam.sh"
 )
 
+# Log dir owned solely by this orchestrator (a sibling of the clone under the
+# deploy root: /tmp/deployza/repo is the clone, /tmp/deployza/logs is ours). The
+# child scripts know NOTHING about logging — they just echo to stdout/stderr as
+# before; this orchestrator decides where that output lands by redirecting each
+# child's stream (see run_child) to its own per-child log file. This keeps
+# logging policy in one place instead of duplicated across four scripts.
+readonly LOG_DIR="/tmp/deployza/logs"
+
+# Whether a usable log dir exists (set by init_logging). When false, we skip the
+# per-child redirection and let output pass straight through to stdout/stderr, so
+# a log-dir failure never blocks a deploy.
+LOGGING=false
+
+# init_logging: create the shared log dir once, best-effort, and start teeing this
+# orchestrator's OWN output (its banners) to assess-install.log while still
+# passing it to stdout. If the dir can't be created we warn and leave
+# LOGGING=false rather than aborting under `set -e`; children then run
+# unredirected (see run_child) and everything goes to stdout only.
+init_logging() {
+  if mkdir -p "$LOG_DIR" 2>/dev/null; then
+    LOGGING=true
+    exec > >(tee -a "${LOG_DIR}/assess-install.log") 2>&1
+  else
+    echo "WARNING: could not create ${LOG_DIR}; child output goes to stdout only." >&2
+  fi
+}
+
+# run_child: invoke one child deploy script with APP_ENV, sending its combined
+# stdout+stderr to that child's own log file (${LOG_DIR}/<basename>.log) AND on
+# to our stdout, so the boot-time vm-startup.service journal still sees the whole
+# run. Falls back to a plain (unredirected) run when logging is unavailable.
+# `bash "$child_path"` needs only read permission, so the execute bit is not
+# load-bearing; we do not chmod the child here.
+run_child() {
+  local child_path="$1" app_env="$2"
+  if [[ "$LOGGING" == true ]]; then
+    local child_log="${LOG_DIR}/$(basename "${child_path%.sh}").log"
+    bash "$child_path" "$app_env" 2>&1 | tee -a "$child_log"
+  else
+    bash "$child_path" "$app_env"
+  fi
+}
+
 # parse_args: validate the launcher contract and echo APP_ENV.
 # APP_ENV is required — refuse to run without it rather than deploying to a
 # wrong default environment.
@@ -58,6 +101,7 @@ parse_args() {
 main() {
   local app_env
   app_env="$(parse_args "$@")"
+  init_logging          # create ${LOG_DIR}; per-child output is teed in run_child
 
   echo "==============================================================="
   echo "assess-install orchestrator: deploying all assess apps (${app_env})"
@@ -71,9 +115,15 @@ main() {
       exit 1
     fi
 
+    # We invoke children via `bash "$child_path"` (in run_child), which needs only
+    # read permission — the execute bit is not load-bearing here. Set it anyway so
+    # a child stays runnable standalone (`./assess-server.sh`), mirroring the +x
+    # vm-startup.sh applies to this orchestrator.
+    chmod +x "$child_path" 2>/dev/null || true
+
     echo
     echo "--- Running ${child} (${app_env}) ---------------------------"
-    bash "$child_path" "$app_env"
+    run_child "$child_path" "$app_env"
     echo "--- Finished ${child} ---------------------------------------"
   done
 
