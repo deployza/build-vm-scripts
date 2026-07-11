@@ -202,11 +202,15 @@ download_war() {
   gsutil cp "$WAR_URI" "$TMP_WAR"
 }
 
-# install_context: install the per-webapp context descriptor BEFORE the WAR.
-# Files are installed VERBATIM. <CONTEXT_PATH>.xml IS the Tomcat context
-# descriptor (its basename sets the context path) -> conf/Catalina/localhost/,
-# the dir Tomcat scans. This is a static UI, so there is no app.properties or
-# logback to install alongside it.
+# install_context: install the per-webapp context descriptor AFTER
+# undeploy_previous but BEFORE the WAR. Tomcat's HostConfig treats <ctx>.xml as
+# belonging to the deployed WAR, so undeploying the old WAR deletes
+# conf/Catalina/localhost/<ctx>.xml; if we wrote the descriptor first,
+# undeploy_previous would remove it out from under us. Files are installed
+# VERBATIM. <CONTEXT_PATH>.xml IS the Tomcat context descriptor (its basename
+# sets the context path) -> conf/Catalina/localhost/, the dir Tomcat scans. This
+# is a static UI, so there is no app.properties or logback to install alongside
+# it.
 install_context() {
   echo "Installing context descriptor to ${CATALINA_LOCALHOST}/..."
   install -d -o "$TOMCAT_USER" -g "$TOMCAT_GROUP" -m 750 "$CATALINA_LOCALHOST"
@@ -299,8 +303,10 @@ main() {
   load_props            # reads install.properties, derives the rest of the paths
   verify_install_files
   download_war
-  install_context       # context file must land BEFORE the WAR is deployed
-  undeploy_previous
+  undeploy_previous     # tear down old context FIRST (Tomcat's undeploy of the
+                        # old WAR can delete conf/Catalina/localhost/<ctx>.xml)
+  install_context       # then write the descriptor, so nothing deletes it before
+                        # the new WAR picks it up
   deploy_war
 
   echo "Deployment complete."
